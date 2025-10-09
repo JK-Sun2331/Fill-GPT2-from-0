@@ -81,10 +81,10 @@ class Attention(nn.Module):
         attention_scores = attention_scores / (self.head_dim ** 0.5)
 
         mask = self.mask[:,:,:seq_len,:seq_len]
-        attention_scores = attention_scores.masked_fill(mask == 0,-10000.0)
+        attention_scores = attention_scores.masked_fill(mask == 0,torch.finfo(attention_scores.dtype).min)
         '''
         masked_fill 方法：
-        当 mask == 0 为 True 的位置，用 -10000.0 填充
+        当 mask == 0 为 True 的位置，用最小值填充
         当 mask == 0 为 False 的位置，保持原值
         '''
 
@@ -209,11 +209,13 @@ class LLMEngine:
         #Attention块映射
         for i in range(self.config.n_layer):
             #layernorm
-            weight_mapping[f"blocks.{i}.ln_1.weight"] = f"h.{i}.ln_1.weight"
-            weight_mapping[f"blocks.{i}.ln_1.bias"] = f"h.{i}.ln_1.bias"
+            weight_mapping[f"blocks.{i}.ln1.weight"] = f"h.{i}.ln_1.weight"
+            weight_mapping[f"blocks.{i}.ln1.bias"] = f"h.{i}.ln_1.bias"
+            weight_mapping[f"blocks.{i}.ln2.weight"] = f"h.{i}.ln_2.weight"
+            weight_mapping[f"blocks.{i}.ln2.bias"] = f"h.{i}.ln_2.bias"
             #attention
             weight_mapping[f"blocks.{i}.att.query.weight"] = f"h.{i}.attn.c_attn.weight"
-            weight_mapping[f"blcoks.{i}.att.query.bias"] = f"h.{i}.attn.c_attn.bias"
+            weight_mapping[f"blocks.{i}.att.query.bias"] = f"h.{i}.attn.c_attn.bias"
             weight_mapping[f"blocks.{i}.att.proj.weight"] = f"h.{i}.attn.c_proj.weight"
             weight_mapping[f"blocks.{i}.att.proj.bias"] = f"h.{i}.attn.c_proj.bias"
             #mlp
@@ -262,6 +264,11 @@ class LLMEngine:
                 
 
         self.model.load_state_dict(new_state_dict,strict=False)
+        #self.model.load_state_dict(new_state_dict)
+        '''
+        strict默认为true,会检测出哪些权重未被加载
+        但会检测mask 但mask是非学习的 因此在除了mask外若没有其他未加载参数 即可将strict设为false 
+        '''
         self.model.eval()
 
     def generator(self,text : str,temperature : float,top_k : int):
