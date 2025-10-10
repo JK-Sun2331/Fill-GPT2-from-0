@@ -315,6 +315,7 @@ class LLMEngine:
                 #print(f"input_ids[i] = {input_ids},input_ids[i].size() = {input_ids.size()}")
                 '''
                 #判断eos暂且不考虑
+                #eos方案:检查next_token 若有eos_token_id,则处理 然后移除在inputs_ids所在的维度 batch_size --
                 for next_token in next_tokens:
                     if next_tokens.item() == self.eos_token_id:
                         input_ids = torch.cat([input_ids, next_tokens],dim = 1)
