@@ -297,7 +297,7 @@ class LLMEngine:
         
         input_ids = self.text_encoding(texts)
 
-        for i in range(100):
+        for i in range(900): #输入长度 + 循环次数 不能大于1024 否则会越界
             
             with torch.no_grad():
                 logits = self.model(input_ids)      #(batch,seq_len,vocab_size)

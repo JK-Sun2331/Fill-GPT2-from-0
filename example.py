@@ -4,7 +4,7 @@ model_path = "/data1/hfhub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721
 
 if __name__ == "__main__":
     input_text = [
-        "long long ago",
+        "I have 10 dollar",
         "I am watching TV"
         ]
 
