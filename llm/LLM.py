@@ -82,6 +82,7 @@ class Attention(nn.Module):
 
         mask = self.mask[:,:,:seq_len,:seq_len]
         attention_scores = attention_scores.masked_fill(mask == 0,torch.finfo(attention_scores.dtype).min)
+        #print(attention_scores)
         '''
         masked_fill 方法：
         当 mask == 0 为 True 的位置，用最小值填充
@@ -107,13 +108,14 @@ class MLP(nn.Module):
         super().__init__()
 
         self.net1 = nn.Linear(config.hidden_size,config.hidden_size * 4)
+        self.activation = nn.GELU()
         self.net2 = nn.Linear(config.hidden_size * 4,config.hidden_size)
         self.dropout = nn.Dropout(config.resid_pdrop)
     
     def forward(self,x):
         
         output = self.net1(x)
-        output = F.gelu(output)
+        output = self.activation(output)
         output = self.net2(output)
         output = self.dropout(output)
         return output
@@ -255,11 +257,11 @@ class LLMEngine:
                     new_state_dict[f"{my_name}"] = state_dict[hf_name].t()
 
                 else :
-                    new_state_dict[my_name] = state_dict[hf_name]
+                    new_state_dict[my_name] = state_dict[hf_name] 
             
-            #gpt2没有lm_head的权重，因此需要手动加入嵌入层的权重 tie weight
-            if my_name == "lm_head.weight":
-                new_state_dict[my_name] = state_dict["wte.weight"]
+        #gpt2没有lm_head的权重，因此需要手动加入嵌入层的权重 tie weight 
+        if "token_embedding_table.weight" in new_state_dict :
+            new_state_dict["lm_head.weight"] = new_state_dict["token_embedding_table.weight"]
     
                 
 
@@ -280,7 +282,7 @@ class LLMEngine:
 
         input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)
 
-        for i in range(50):
+        for i in range(512):
             
             with torch.no_grad():
                 logits = self.model(input_ids)      #(batch,seq_len,vocab_size)
@@ -295,6 +297,7 @@ class LLMEngine:
                 #next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True) #贪婪解码 效果非常差
 
                 next_token = torch.multinomial(next_token_logits, num_samples=1).to(self.device)
+                #print(f"next token = {next_token.item()}")
                 if next_token >= self.config.vocab_size:
                     # 如果无效，选择概率最高的有效token
                     next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
