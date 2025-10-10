@@ -5,6 +5,7 @@ import torch.utils.data as Dataset
 import torch.utils.data as DataLoader
 from dataclasses import dataclass
 import tiktoken
+from transformers import AutoTokenizer
 
 import os
 from safetensors.torch import load_file
@@ -183,7 +184,8 @@ class LLMEngine:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.config = GPTConfig
         self.model = GPT2(self.config).to(self.device)
-        self.tokenizer = tiktoken.get_encoding("gpt2")
+        #self.tokenizer = tiktoken.get_encoding("gpt2")     #使用tiktoken面对批处理编码时 需要左填充 并设置 mask 很麻烦
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self._load_weight(self.model_path)
 
         self.eos_token_id = self.config.eos_token_id
@@ -273,16 +275,29 @@ class LLMEngine:
         '''
         self.model.eval()
 
-    def generator(self,text : str,temperature : float,top_k : int):
+    def text_encoding(self,texts : list[str]):
+        tokenizer = self.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
-        print(f"input_text:{text}")
+        inputs = tokenizer(
+            texts, 
+            padding=True,       # 开启自动填充
+            truncation=True,    # 开启自动截断
+            return_tensors="pt" # 返回 PyTorch 张量
+            )
+        input_ids = torch.tensor(inputs["input_ids"], dtype=torch.long, device=self.device)
+        return input_ids
 
-        input_ids = self.tokenizer.encode(text)
-        input_len = len(text)
+    def generator(self,texts : list[str],temperature : float,top_k : int):
+        
+        batch_size = len(texts)
+        input_ids = []
+        output_texts = []
+        
+        input_ids = self.text_encoding(texts)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-
-        for i in range(512):
+        for i in range(100):
             
             with torch.no_grad():
                 logits = self.model(input_ids)      #(batch,seq_len,vocab_size)
@@ -290,24 +305,26 @@ class LLMEngine:
 
                 if top_k > 0:
                     values, indices = torch.topk(next_token_logits, top_k)  #value返回降序大小为topk的数组,indice是其在原数据的标号
-                    #print(f"i_value : {values}")   #基本全是负数 输出可能不正常
                     next_token_logits[next_token_logits < values[:, -1, None]] = -float("inf")
 
                 next_token_logits = F.softmax(next_token_logits,dim = -1)
                 #next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True) #贪婪解码 效果非常差
+                next_tokens = torch.multinomial(next_token_logits, num_samples=1).to(self.device)
+                    
+                #print(f"next_token = {next_tokens},next_token.size = {next_tokens.size()}")
+                #print(f"input_ids[i] = {input_ids},input_ids[i].size() = {input_ids.size()}")
+                '''
+                #判断eos暂且不考虑
+                for next_token in next_tokens:
+                    if next_tokens.item() == self.eos_token_id:
+                        input_ids = torch.cat([input_ids, next_tokens],dim = 1)
+                        print("get eos token id")
+                        break
+                '''
+                input_ids = torch.cat([input_ids, next_tokens],dim = 1)
+                #print(f"input_ids[i] = {input_ids},input_ids[i].size() = {input_ids.size()}\n\n")
 
-                next_token = torch.multinomial(next_token_logits, num_samples=1).to(self.device)
-                #print(f"next token = {next_token.item()}")
-                if next_token >= self.config.vocab_size:
-                    # 如果无效，选择概率最高的有效token
-                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-                if next_token.item() == self.eos_token_id:
-                    input_ids = torch.cat([input_ids, next_token], dim=1)
-                    print("get eos token id")
-                    break
-
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-        generated_ids = input_ids[0].tolist()
-        output_text = self.tokenizer.decode(generated_ids)
-        return output_text[input_len:]
+        for i in range(batch_size):
+            generated_ids = input_ids[i].tolist()
+            output_texts.append(self.tokenizer.decode(generated_ids))
+        return output_texts
