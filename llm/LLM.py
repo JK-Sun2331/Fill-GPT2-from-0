@@ -163,7 +163,7 @@ class GPT2(nn.Module):
     def forward(self,input_ids):
 
         batch,seq_len = input_ids.size()      #(batch,seq_len)
-        #print(f"seq_len = {seq_len},input_ids.size() = {input_ids.size()}")
+
         assert seq_len <= self.max_seq_len , f"序列长度超出最大序列长度 seq_len = {seq_len},max_seq_len = {self.max_seq_len}"
 
         token_embd = self.token_embedding_table(input_ids)    #(batch,seq_len,n_embd)
@@ -298,7 +298,7 @@ class LLMEngine:
         
         input_ids = self.text_encoding(texts)
 
-        for i in range(100): #输入长度 + 循环次数 不能大于1024 否则会越界
+        for i in range(900): #输入长度 + 循环次数 不能大于1024 否则会越界
             
             with torch.no_grad():
                 logits = self.model(input_ids)      #(batch,seq_len,vocab_size)
@@ -314,14 +314,12 @@ class LLMEngine:
 
                 input_ids = torch.cat([input_ids, next_tokens],dim = 1)
 
-                mask = (next_tokens != self.eos_token_id).squeeze()     #如果新生成的token所在行包含eos,那么将其掩盖
-
+                mask = (next_tokens != self.eos_token_id).squeeze(-1)     #如果新生成的token所在行包含eos,那么将其掩盖
 
                 if len(input_ids[~mask].tolist()) != 0:
-                    output_ids.append(input_ids[~mask].tolist())     #将结束的seq输出到output
+                    output_ids.append(input_ids[~mask].squeeze().tolist())     #将结束的seq输出到output
                 
                 input_ids = input_ids[mask]             #将结束的seq在input_ids中移除
-
 
         #若循环结束都没生成eos,那么将所有seq输出
         final_len = input_ids.shape[0]
@@ -331,6 +329,5 @@ class LLMEngine:
 
         for i in range(batch_size):
             generated_ids = output_ids[i]
-            print(f"generated_ids_{i} = {generated_ids}")
             output_texts.append(self.tokenizer.decode(generated_ids))
         return output_texts
