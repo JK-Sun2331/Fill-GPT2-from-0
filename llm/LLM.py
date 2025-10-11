@@ -293,11 +293,12 @@ class LLMEngine:
         
         batch_size = len(texts)
         input_ids = []
+        output_ids = []
         output_texts = []
         
         input_ids = self.text_encoding(texts)
 
-        for i in range(900): #输入长度 + 循环次数 不能大于1024 否则会越界
+        for i in range(100): #输入长度 + 循环次数 不能大于1024 否则会越界
             
             with torch.no_grad():
                 logits = self.model(input_ids)      #(batch,seq_len,vocab_size)
@@ -310,22 +311,26 @@ class LLMEngine:
                 next_token_logits = F.softmax(next_token_logits,dim = -1)
                 #next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True) #贪婪解码 效果非常差
                 next_tokens = torch.multinomial(next_token_logits, num_samples=1).to(self.device)
-                    
-                #print(f"next_token = {next_tokens},next_token.size = {next_tokens.size()}")
-                #print(f"input_ids[i] = {input_ids},input_ids[i].size() = {input_ids.size()}")
-                '''
-                #判断eos暂且不考虑
-                #eos方案:检查next_token 若有eos_token_id,则处理 然后移除在inputs_ids所在的维度 batch_size --
-                for next_token in next_tokens:
-                    if next_tokens.item() == self.eos_token_id:
-                        input_ids = torch.cat([input_ids, next_tokens],dim = 1)
-                        print("get eos token id")
-                        break
-                '''
+
                 input_ids = torch.cat([input_ids, next_tokens],dim = 1)
-                #print(f"input_ids[i] = {input_ids},input_ids[i].size() = {input_ids.size()}\n\n")
+
+                mask = (next_tokens != self.eos_token_id).squeeze()     #如果新生成的token所在行包含eos,那么将其掩盖
+
+
+                if len(input_ids[~mask].tolist()) != 0:
+                    output_ids.append(input_ids[~mask].tolist())     #将结束的seq输出到output
+                
+                input_ids = input_ids[mask]             #将结束的seq在input_ids中移除
+
+
+        #若循环结束都没生成eos,那么将所有seq输出
+        final_len = input_ids.shape[0]
+
+        for i in range(final_len):
+            output_ids.append(input_ids[i].tolist())
 
         for i in range(batch_size):
-            generated_ids = input_ids[i].tolist()
+            generated_ids = output_ids[i]
+            print(f"generated_ids_{i} = {generated_ids}")
             output_texts.append(self.tokenizer.decode(generated_ids))
         return output_texts
