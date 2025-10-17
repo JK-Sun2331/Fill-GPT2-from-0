@@ -4,12 +4,11 @@ import torch.nn.functional as F
 import torch.utils.data as Dataset
 import torch.utils.data as DataLoader
 from dataclasses import dataclass
-import tiktoken
+#import tiktoken
 from transformers import AutoTokenizer
 from llm.Attention import GPT2
 import os
 from safetensors.torch import load_file
-
 
 torch.manual_seed(1024)
 
@@ -43,6 +42,9 @@ class LLMEngine:
 
         self.eos_token_id = self.config.eos_token_id
         self.max_seq_len = self.config.max_seq_len
+
+
+
     
     def _load_weight(self,model_path : str):
         weight_file = os.path.join(model_path,"model.safetensors")
@@ -71,8 +73,8 @@ class LLMEngine:
             weight_mapping[f"blocks.{i}.ln2.weight"] = f"h.{i}.ln_2.weight"
             weight_mapping[f"blocks.{i}.ln2.bias"] = f"h.{i}.ln_2.bias"
             #attention
-            weight_mapping[f"blocks.{i}.att.query.weight"] = f"h.{i}.attn.c_attn.weight"
-            weight_mapping[f"blocks.{i}.att.query.bias"] = f"h.{i}.attn.c_attn.bias"
+            weight_mapping[f"blocks.{i}.att.c_attn.weight"] = f"h.{i}.attn.c_attn.weight"
+            weight_mapping[f"blocks.{i}.att.c_attn.bias"] = f"h.{i}.attn.c_attn.bias"
             weight_mapping[f"blocks.{i}.att.proj.weight"] = f"h.{i}.attn.c_proj.weight"
             weight_mapping[f"blocks.{i}.att.proj.bias"] = f"h.{i}.attn.c_proj.bias"
             #mlp
@@ -87,23 +89,7 @@ class LLMEngine:
             #因为用linear(input,output)初始化的权重 其权重形状是(output,input) 因此取权重时要转置
             if hf_name in state_dict:
                 if "attn.c_attn.weight" in hf_name:
-                    #在gpt2中 QKV权重存在一个矩阵里，因此要切分
-                    weight = state_dict[hf_name]
-                    split_size = weight.size(1) // 3    #(768,2304)
-                    q_weight,k_weight,v_weght = torch.split(weight,split_size,dim = 1)
-
-                    new_state_dict[f"{my_name}"] = q_weight.t()
-                    new_state_dict[my_name.replace("query","key")] = k_weight.t()
-                    new_state_dict[my_name.replace("query","value")] = v_weght.t()
-                
-                elif "attn.c_attn.bias" in hf_name:
-                    bias = state_dict[hf_name]
-                    split_size = bias.size(0) // 3
-                    q_bias,k_bias,v_bias = torch.split(bias,split_size,dim = 0)
-                    new_state_dict[f"{my_name}"] = q_bias
-                    new_state_dict[my_name.replace("query","key")] = k_bias
-                    new_state_dict[my_name.replace("query","value")] = v_bias
-                
+                    new_state_dict[my_name] = state_dict[hf_name].t()
                 
                 elif "attn.c_proj.weight" in hf_name:
                     new_state_dict[my_name] = state_dict[hf_name].t()
@@ -127,6 +113,12 @@ class LLMEngine:
         self.model.eval()
 
 
+    #def allocate_kvcache(self,config):
+        #token_kvcache_size = 2 * n_layer * head_dim * 4(f32) = 2 * 12 * 768 * 4 = 73728B
+        #seq_kvcache_size = max_seq_size * token_kvcache_size = 1024 * 73728B = 73728KB
+        #batched_kvcache_size = batch_size * seq_kvcache_size = 12 * 73728KB = 864MB
+
+
 
     def text_encoding(self,texts : list[str]):
         tokenizer = self.tokenizer
@@ -142,47 +134,69 @@ class LLMEngine:
         input_ids = torch.tensor(inputs["input_ids"], dtype=torch.long, device=self.device)
         return input_ids
     
+    def sampling(self,logits,temperature : float,top_k : int):
 
+        next_token_logits = logits[:,-1,:] / temperature
 
+        if top_k > 0:
+            values, indices = torch.topk(next_token_logits, top_k)  #value返回降序大小为topk的数组,indice是其在原数据的标号
+            next_token_logits[next_token_logits < values[:, -1, None]] = -float("inf")
+        next_token_logits = F.softmax(next_token_logits,dim = -1)
+
+        #next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True) #贪婪解码 效果非常差
+        next_tokens = torch.multinomial(next_token_logits, num_samples=1).to(self.device)
+
+        return next_tokens
+    
+
+    @torch.no_grad()
     def generator(self,texts : list[str],temperature : float,top_k : int):
         
         batch_size = len(texts)
-        input_ids = []
-        output_ids = []
+        output = []
         output_texts = []
-        
-        input_ids = self.text_encoding(texts)
 
-        for i in range(900): #输入长度 + 循环次数 不能大于1024 否则会越界
+        prompt_ids = self.text_encoding(texts)
+
+        #第一轮先处理prefill
+        logits,past_kv = self.model(input_ids = prompt_ids,past_key_value = None)  #(batch,seq_len,vocab_size)
+        next_token = self.sampling(logits,temperature,top_k)
+        output_ids = next_token
             
-            with torch.no_grad():
-                logits = self.model(input_ids)      #(batch,seq_len,vocab_size)
-                next_token_logits = logits[:,-1,:] / temperature
+        for i in range(100): #输入长度 + 循环次数 不能大于1024 否则会越界
+            #循环decode
+            logits,past_kv = self.model(input_ids = next_token,past_key_value = past_kv)   #(batch,seq_len,vocab_size)
+            next_token = self.sampling(logits,temperature,top_k)
+            output_ids = torch.cat([output_ids, next_token],dim = 1)
 
-                if top_k > 0:
-                    values, indices = torch.topk(next_token_logits, top_k)  #value返回降序大小为topk的数组,indice是其在原数据的标号
-                    next_token_logits[next_token_logits < values[:, -1, None]] = -float("inf")
+            mask = (next_token != self.eos_token_id).squeeze(-1)     #如果新生成的token所在行包含eos,那么将其掩盖
 
-                next_token_logits = F.softmax(next_token_logits,dim = -1)
-                #next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True) #贪婪解码 效果非常差
-                next_tokens = torch.multinomial(next_token_logits, num_samples=1).to(self.device)
-
-                input_ids = torch.cat([input_ids, next_tokens],dim = 1)
-
-                mask = (next_tokens != self.eos_token_id).squeeze(-1)     #如果新生成的token所在行包含eos,那么将其掩盖
-
-                if len(input_ids[~mask].tolist()) != 0:
-                    output_ids.append(input_ids[~mask].squeeze().tolist())     #将结束的seq输出到output
+            if len(output_ids[~mask].tolist()) != 0:
+                output.append(output_ids[~mask].squeeze().tolist())     #将结束的seq输出到output
                 
-                input_ids = input_ids[mask]             #将结束的seq在input_ids中移除
-
+            next_token = next_token[mask]             #将结束的seq移除
+            output_ids = output_ids[mask]
+    
+        
+            for ids in mask.flatten():
+                if ids.item() == 0:
+                    past_kv = list(past_kv)
+                    for i,layer in enumerate(past_kv):
+                        past_kv[i] = list(past_kv[i])
+                        k_cache = layer[0][mask]
+                        v_cache = layer[1][mask]
+                        past_kv[i] = [k_cache,v_cache]
+                        past_kv[i] = tuple(past_kv[i])
+                    past_kv = tuple(past_kv)
+                    break
+                     
         #若循环结束都没生成eos,那么将所有seq输出
-        final_len = input_ids.shape[0]
+        final_len = output_ids.shape[0]
 
         for i in range(final_len):
-            output_ids.append(input_ids[i].tolist())
+            output.append(output_ids[i].tolist())
 
         for i in range(batch_size):
-            generated_ids = output_ids[i]
+            generated_ids = output[i]
             output_texts.append(self.tokenizer.decode(generated_ids))
         return output_texts

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional,Tuple
 
 
 class Attention(nn.Module):
@@ -14,9 +15,10 @@ class Attention(nn.Module):
         self.max_seq_len = config.max_seq_len
         self.n_head = config.n_head
 
-        self.key = nn.Linear(self.hidden_size,self.all_head_size)
-        self.value = nn.Linear(self.hidden_size,self.all_head_size)
-        self.query = nn.Linear(self.hidden_size,self.all_head_size)
+        self.c_attn = nn.Linear(self.hidden_size, 3 * self.hidden_size)     #将QKV合为一个线性层
+        #self.key = nn.Linear(self.hidden_size,self.all_head_size)
+        #self.value = nn.Linear(self.hidden_size,self.all_head_size)
+        #self.query = nn.Linear(self.hidden_size,self.all_head_size)
 
         self.proj = nn.Linear(self.hidden_size,self.hidden_size)
 
@@ -33,30 +35,43 @@ class Attention(nn.Module):
             torch.tril(torch.ones(self.max_seq_len,self.max_seq_len,device=config.device).view(1,1,self.max_seq_len,self.max_seq_len)) #下三角
         )
 
+
     def transpose_for_scores(self,x):
         new_x_shape = x.size()[:-1] + (self.n_head,self.head_dim) #(batch,seq_len,768) -> (batch,seq_len,12,64)
         x = x.view(new_x_shape)
         return x.permute(0,2,1,3) #维度置换 (batch,seq_len,n_head,head_dim) -> (batch,n_head,seq_len,head_dim)
 
-    def forward(self,hidden_state):
+
+    def forward(self,
+                hidden_state : torch.Tensor,
+                past_key_value : Optional[Tuple[torch.Tensor,torch.Tensor]] = None
+                ) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
+        
         batch_size,seq_len,_ = hidden_state.size()
+        qkv = self.c_attn(hidden_state)
+        query,key,value = qkv.split(self.hidden_size,dim = -1)
 
-        query_layer = self.query(hidden_state)
-        key_layer = self.key(hidden_state)
-        value_layer = self.value(hidden_state)
+        ##维度置换 (batch,seq_len,hidden_size) -> (batch,seq_len,n_head,head_dim) -> (batch,n_head,seq_len,head_dim)
+        query = self.transpose_for_scores(query)    
+        key = self.transpose_for_scores(key)
+        value = self.transpose_for_scores(value)
 
-        query_layer = self.transpose_for_scores(query_layer)
-        key_layer = self.transpose_for_scores(key_layer)
-        value_layer = self.transpose_for_scores(value_layer)
+        if past_key_value is not None :     #有缓存 说明是decode
+            past_key,past_value = past_key_value
+            key = torch.cat((past_key,key),dim = -2)    #在 seq_len维度拼接
+            value = torch.cat((past_value,value),dim = -2)
 
-        attention_scores = torch.matmul(query_layer,key_layer.transpose(-1,-2)) #将key的后两维转置
+        present_key_value = (key,value)
+
+        attention_scores = torch.matmul(query,key.transpose(-1,-2)) #将key的后两维转置
         #torch.matmul()处理高维矩阵乘法：当输入维度高于2时会执行批量矩阵乘法 (...,m,p) * (...,p,n) = (...,m,n)
         #attention_scores = (batch,n_head,seq_len,head_dim) * (batch,n_head,head_dim,seq_len) = (batch,n_head,seq_len,seq_len)
         attention_scores = attention_scores / (self.head_dim ** 0.5)
 
-        mask = self.mask[:,:,:seq_len,:seq_len]
+        #只需在prefill阶段需要mask decode阶段不需要
+        total_seq_len = key.shape[-2]
+        mask = self.mask[:,:,total_seq_len - seq_len:total_seq_len,total_seq_len - seq_len: total_seq_len]
         attention_scores = attention_scores.masked_fill(mask == 0,torch.finfo(attention_scores.dtype).min)
-        #print(attention_scores)
         '''
         masked_fill 方法：
         当 mask == 0 为 True 的位置，用最小值填充
@@ -66,14 +81,14 @@ class Attention(nn.Module):
         attention_scores = F.softmax(attention_scores,dim=-1)
         attention_scores = self.attn_dropout(attention_scores)
 
-        attention_scores = torch.matmul(attention_scores,value_layer)   #(batch,n_head,seq_len,head_dim)
+        attention_scores = torch.matmul(attention_scores,value)   #(batch,n_head,seq_len,head_dim)
         attention_scores = attention_scores.permute(0,2,1,3).contiguous()   #(batch,seq_len,n_head,head_dim)
         new_attention_scores_shape = attention_scores.size()[:-2] + (self.all_head_size,)   
         attention_scores = attention_scores.view(new_attention_scores_shape)    #(batch,seq_len,hidden_dim)
 
         output = self.proj(attention_scores)    #(bacth,seq_len,hidden_dim)
         output = self.resid_dropout(output)
-        return output
+        return output,present_key_value
 
     
 class MLP(nn.Module):
@@ -86,9 +101,9 @@ class MLP(nn.Module):
         self.net2 = nn.Linear(config.hidden_size * 4,config.hidden_size)
         self.dropout = nn.Dropout(config.resid_pdrop)
     
-    def forward(self,x):
-        
-        output = self.net1(x)
+    def forward(self,hidde_state):
+
+        output = self.net1(hidde_state)
         output = self.activation(output)
         output = self.net2(output)
         output = self.dropout(output)
@@ -104,10 +119,16 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(config.hidden_size,eps=1e-05)
         self.ln2 = nn.LayerNorm(config.hidden_size,eps=1e-05)
 
-    def forward(self,x):
-        x = x + self.att(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
-        return x
+    def forward(self,
+                hidden_states : torch.Tensor,
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+                ) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
+        
+        attn_output,present_key_value = self.att(self.ln1(hidden_states),past_key_value)
+        hidden_states = hidden_states + attn_output
+        ffn_output = self.ffn(self.ln2(hidden_states))
+        hidden_states = hidden_states + ffn_output
+        return hidden_states,present_key_value
     
 class GPT2(nn.Module):
     '''
@@ -124,27 +145,38 @@ class GPT2(nn.Module):
 
         self.token_embedding_table = nn.Embedding(config.vocab_size,config.n_embd)
         self.position_embedding_table = nn.Embedding(config.max_seq_len,config.n_embd)
-        self.blocks = nn.Sequential(
-           * [Block(config) for _ in range(config.n_layer)]
-        )
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_final = nn.LayerNorm(config.n_embd,eps=1e-05)
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size,bias = False)
 
         self.token_embedding_table.weight = self.lm_head.weight     #tie weight gpt2源码没有
 
     
-    def forward(self,input_ids):
-
+    def forward(self,
+                input_ids : torch.Tensor,
+                past_key_value : Optional[Tuple[Tuple[torch.Tensor,torch.Tensor]]] = None
+                ) -> Tuple[torch.Tensor,Tuple[Tuple[torch.Tensor,torch.Tensor]]]:
+        
+        device = input_ids.device
         batch,seq_len = input_ids.size()      #(batch,seq_len)
+        #assert seq_len <= self.max_seq_len , f"序列长度超出最大序列长度 seq_len = {seq_len},max_seq_len = {self.max_seq_len}"
 
-        assert seq_len <= self.max_seq_len , f"序列长度超出最大序列长度 seq_len = {seq_len},max_seq_len = {self.max_seq_len}"
+        past_lenth = past_key_value[0][0].shape[-2] if past_key_value is not None else 0
+        position_ids = torch.arange(past_lenth,past_lenth + seq_len,device=device)
 
         token_embd = self.token_embedding_table(input_ids)    #(batch,seq_len,n_embd)
-        pos_embd = self.position_embedding_table(
-            torch.arange(seq_len,device=input_ids.device)
-        )
-        x = token_embd + pos_embd       #(batch,seq_len,n_embd)
-        x = self.blocks(x)
-        x = self.ln_final(x)
-        logits = self.lm_head(x)        #(batch,seq_len,vocab_size)
-        return logits
+        pos_embd = self.position_embedding_table(position_ids)
+        hidden_states = token_embd + pos_embd       #(batch,seq_len,n_embd)
+
+        presents = []
+
+        for i,block in enumerate(self.blocks):
+
+            past_layer = past_key_value[i] if past_key_value is not None else None
+            hidden_states,present_key_value = block(hidden_states = hidden_states,past_key_value = past_layer)
+            presents.append(present_key_value)
+
+        hidden_states = self.ln_final(hidden_states)
+        logits = self.lm_head(hidden_states)        #(batch,seq_len,vocab_size)
+        return logits,tuple(presents)
+
