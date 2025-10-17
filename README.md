@@ -10,3 +10,11 @@
 
 ## 2025.10.11
 完善了批处理功能
+
+## 2025.10.17
+在原模型的基础上加入了KV-cache功能。
+对于同样的prompt,decode 900次 由11.56s -> 5.68s 
+另外GPT2-137M 存放KV-cache的空间如下计算：
+token_kvcache_size = 2 * n_layer * head_dim * 4(f32) = 2 * 12 * 768 * 4 = 73728B
+seq_kvcache_size = max_seq_size * token_kvcache_size = 1024 * 73728B = 73728KB
+batched_kvcache_size = batch_size * seq_kvcache_size = 12 * 73728KB / 1024 = 864MB

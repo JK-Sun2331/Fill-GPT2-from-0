@@ -18,4 +18,4 @@ if __name__ == "__main__":
     for i in range(batch_size):
         print(f"\n\noutput_text {i} : {output[i]}\n\n")
 
-    print(end - start)
+    print(end - start)  #5.68s
