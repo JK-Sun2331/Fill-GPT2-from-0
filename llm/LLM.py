@@ -163,7 +163,7 @@ class LLMEngine:
         next_token = self.sampling(logits,temperature,top_k)
         output_ids = next_token
             
-        for i in range(200): #输入长度 + 循环次数 不能大于1024 否则会越界
+        for i in range(900): #输入长度 + 循环次数 不能大于1024 否则会越界
             #循环decode
             logits,past_kv = self.model(input_ids = next_token,past_key_value = past_kv)   #(batch,seq_len,vocab_size)
             next_token = self.sampling(logits,temperature,top_k)
