@@ -2,7 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional,Tuple
+from llm.linear import ColumnParallelLinear,RowParallelLinear
+from safetensors.torch import load_file
 
+
+model_weights_path = "/data1/hfhub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/model.safetensors" 
+state_dict = load_file(model_weights_path)
 
 class Attention(nn.Module):
 
@@ -96,10 +101,19 @@ class MLP(nn.Module):
     def __init__(self,config):
         super().__init__()
 
+        '''
+        #朴素
         self.net1 = nn.Linear(config.hidden_size,config.hidden_size * 4)
         self.activation = nn.GELU()
         self.net2 = nn.Linear(config.hidden_size * 4,config.hidden_size)
         self.dropout = nn.Dropout(config.resid_pdrop)
+        '''
+
+        #提前讲MLP权重加载进来
+        c_fc_weight = state_dict[""]
+        self.net1 = ColumnParallelLinear()
+
+        
     
     def forward(self,hidde_state):
 
@@ -149,7 +163,7 @@ class GPT2(nn.Module):
         self.ln_final = nn.LayerNorm(config.n_embd,eps=1e-05)
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size,bias = False)
 
-        self.token_embedding_table.weight = self.lm_head.weight     #tie weight gpt2源码没有
+        self.token_embedding_table.weight = self.lm_head.weight     #tie weight 
 
     
     def forward(self,

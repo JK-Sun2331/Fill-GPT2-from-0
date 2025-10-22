@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from llm.Attention import GPT2
 import os
 from safetensors.torch import load_file
+import torch.distributed as dist
 
 torch.manual_seed(1024)
 
@@ -29,11 +30,28 @@ class GPTConfig:
 
     device = 1
     
+def setup_distributed():
+
+    if not dist.is_initialized():
+        #CUDA_VISIBLE_DEVICES="0,1" torchrun --nproc_per_node=2 your_inference_script.py
+        local_rank = int(os.environ.get('LOCAL_RANK'))
+        torch.cuda.set_device(local_rank)   #设置当前进程使用的GPU
+
+        dist.init_process_group(backend = 'nccl')   #初始化进程组
+        
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    
+    return rank,world_size
+
+
+
+
 class LLMEngine:
 
     def __init__(self,model_path : str,device : int):
         self.model_path = model_path
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device,self.world_size = setup_distributed()
         self.config = GPTConfig
         self.model = GPT2(self.config).to(self.device)
         #self.tokenizer = tiktoken.get_encoding("gpt2")     #使用tiktoken面对批处理编码时 需要左填充 并设置 mask 很麻烦

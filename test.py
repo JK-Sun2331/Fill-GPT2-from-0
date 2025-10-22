@@ -1,11 +1,21 @@
-from transformers import GPT2Model, GPT2Config
+import torch.distributed as dist
+import torch
+import os
 
-# 如果是从本地目录加载，指定目录路径
-model_path = "/data1/hfhub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e"
+#CUDA_VISIBLE_DEVICES="0,1" torchrun --nproc_per_node=2 your_inference_script.py
 
-# 加载配置和模型
-config = GPT2Config.from_pretrained(model_path)
-model = GPT2Model.from_pretrained(model_path)
+def setup_distributed():
 
-# 打印模型结构
-print(model)
+    if not dist.is_initialized():
+        local_rank = int(os.environ.get('LOCAL_RANK'))
+        torch.cuda.set_device(local_rank)   #设置当前进程使用的GPU
+
+        dist.init_process_group(backend = 'nccl')   #初始化进程组
+        
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    
+    return rank,world_size
+
+rank,world_size = setup_distributed()
+print(rank,world_size)
