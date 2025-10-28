@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from llm.Attention import GPT2
 import os
 from safetensors.torch import load_file
+import torch.distributed as dist
 
 torch.manual_seed(1024)
 
@@ -27,18 +28,35 @@ class GPTConfig:
     vocab_size : int = 50257 
     eos_token_id : int = 50256
 
-    device = 1
+    #device = 1
     
+def setup_distributed():
+
+    if not dist.is_initialized():
+        #CUDA_VISIBLE_DEVICES="0,1" torchrun --nproc_per_node=2 your_inference_script.py
+        local_rank = int(os.environ.get('LOCAL_RANK'))
+        torch.cuda.set_device(local_rank)   #设置当前进程使用的GPU
+
+        dist.init_process_group(backend = 'nccl')   #初始化进程组
+        
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    
+    return rank,world_size
+
+
+
+
 class LLMEngine:
 
-    def __init__(self,model_path : str,device : int):
+    def __init__(self,model_path : str):
         self.model_path = model_path
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device,self.world_size = setup_distributed()
         self.config = GPTConfig
-        self.model = GPT2(self.config).to(self.device)
+        self.model = GPT2(self.config,self.device,self.world_size).to(self.device)
         #self.tokenizer = tiktoken.get_encoding("gpt2")     #使用tiktoken面对批处理编码时 需要左填充 并设置 mask 很麻烦
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self._load_weight(self.model_path)
+        self._load_weight(self.model_path,self.device,self.world_size)
 
         self.eos_token_id = self.config.eos_token_id
         self.max_seq_len = self.config.max_seq_len
@@ -46,7 +64,7 @@ class LLMEngine:
 
 
     
-    def _load_weight(self,model_path : str):
+    def _load_weight(self,model_path : str,tp_rank,tp_size):
         weight_file = os.path.join(model_path,"model.safetensors")
         assert weight_file,"There is no weight_file"
 
@@ -73,8 +91,13 @@ class LLMEngine:
             weight_mapping[f"blocks.{i}.ln2.weight"] = f"h.{i}.ln_2.weight"
             weight_mapping[f"blocks.{i}.ln2.bias"] = f"h.{i}.ln_2.bias"
             #attention
-            weight_mapping[f"blocks.{i}.att.c_attn.weight"] = f"h.{i}.attn.c_attn.weight"
-            weight_mapping[f"blocks.{i}.att.c_attn.bias"] = f"h.{i}.attn.c_attn.bias"
+            weight_mapping[f"blocks.{i}.att.query.weight"] = f"h.{i}.attn.c_attn.weight"
+            weight_mapping[f"blocks.{i}.att.key.weight"] = f"h.{i}.attn.c_attn.weight"
+            weight_mapping[f"blocks.{i}.att.value.weight"] = f"h.{i}.attn.c_attn.weight"
+            weight_mapping[f"blocks.{i}.att.query.bias"] = f"h.{i}.attn.c_attn.bias"
+            weight_mapping[f"blocks.{i}.att.key.bias"] = f"h.{i}.attn.c_attn.bias"
+            weight_mapping[f"blocks.{i}.att.value.bias"] = f"h.{i}.attn.c_attn.bias"
+            
             weight_mapping[f"blocks.{i}.att.proj.weight"] = f"h.{i}.attn.c_proj.weight"
             weight_mapping[f"blocks.{i}.att.proj.bias"] = f"h.{i}.attn.c_proj.bias"
             #mlp
@@ -89,13 +112,90 @@ class LLMEngine:
             #因为用linear(input,output)初始化的权重 其权重形状是(output,input) 因此取权重时要转置
             if hf_name in state_dict:
                 if "attn.c_attn.weight" in hf_name:
-                    new_state_dict[my_name] = state_dict[hf_name].t()
-                
+                    # hf_name 会被 Q, K, V 映射三次
+                    # 我们只在第一次 (query) 时处理，并同时加载 K 和 V
+                    if "query" not in my_name:
+                        continue 
+
+                    weight = state_dict[hf_name].t()
+                    
+                    
+                    split_size = weight.size(0) // 3    
+                    q_weight,k_weight,v_weght = torch.split(weight,split_size,dim = 0) 
+
+                    dim = 0
+                    chunk_size = q_weight.shape[dim] // tp_size
+                    start = tp_rank * chunk_size
+                    end = (tp_rank + 1) * chunk_size
+
+
+                    new_state_dict[my_name] = q_weight[start:end,:].contiguous()
+                    new_state_dict[my_name.replace("query","key")] = k_weight[start:end,:].contiguous()
+                    new_state_dict[my_name.replace("query","value")] = v_weght[start:end,:].contiguous()
+
+                elif "attn.c_attn.bias" in hf_name:
+                    # 同样只在 "query" 时处理
+                    if "query" not in my_name:
+                        continue
+                        
+                    bias = state_dict[hf_name]
+                    split_size = bias.size(0) // 3
+                    q_bias,k_bias,v_bias = torch.split(bias,split_size,dim = 0)
+
+                    dim = 0
+                    chunk_size = q_bias.shape[dim] // tp_size
+                    start = tp_rank * chunk_size
+                    end = (tp_rank + 1) * chunk_size
+
+                    new_state_dict[my_name] = q_bias[start:end].contiguous()
+                    new_state_dict[my_name.replace("query","key")] = k_bias[start:end].contiguous()
+                    new_state_dict[my_name.replace("query","value")] = v_bias[start:end].contiguous()
+
+
                 elif "attn.c_proj.weight" in hf_name:
-                    new_state_dict[my_name] = state_dict[hf_name].t()
+                    #new_state_dict[my_name] = state_dict[hf_name].t()
+                    dim = 1
+                    full_tensor = state_dict[hf_name].t()
+                    chunk_size = full_tensor.shape[dim] // tp_size
+                    start = chunk_size * tp_rank
+                    end = chunk_size * (tp_rank + 1)
+                    sharded_tensor_slice = full_tensor[:,start:end].contiguous()
+                    new_state_dict[my_name] = sharded_tensor_slice
+
                 
-                elif "mlp.c_fc.weight" in hf_name or "mlp.c_proj.weight" in hf_name:
-                    new_state_dict[f"{my_name}"] = state_dict[hf_name].t()
+                elif "mlp.c_fc.weight" in hf_name:
+                    #new_state_dict[my_name] = state_dict[hf_name].t()  #no TensorParallel load
+
+                    dim = 0     #先列并行
+                    full_tensor = state_dict[hf_name].t()
+                    chunk_size = full_tensor.shape[dim] // tp_size
+                    start = chunk_size * tp_rank
+                    end = chunk_size * (tp_rank + 1)
+                    sharded_tensor_slice = full_tensor[start:end,:].contiguous()
+                    new_state_dict[my_name] = sharded_tensor_slice
+
+                elif "mlp.c_fc.bias" in hf_name:
+                    #列并行时 偏置也需要切分 但行并行的偏置不需要切分
+                    
+                    dim = 0
+                    full_tensor = state_dict[hf_name].t()
+                    chunk_size = full_tensor.shape[dim] // tp_size
+                    start = chunk_size * tp_rank
+                    end = chunk_size * (tp_rank + 1)
+                    sharded_tensor_slice = full_tensor[start:end].contiguous()
+                    new_state_dict[my_name] = sharded_tensor_slice
+
+                
+                elif "mlp.c_proj.weight" in hf_name:
+                    #new_state_dict[f"{my_name}"] = state_dict[hf_name].t()     #no TensorParallel load
+
+                    dim = 1
+                    full_tensor = state_dict[hf_name].t()
+                    chunk_size = full_tensor.shape[dim] // tp_size
+                    start = chunk_size * tp_rank
+                    end = chunk_size * (tp_rank + 1)
+                    sharded_tensor_slice = full_tensor[:,start:end].contiguous()
+                    new_state_dict[my_name] = sharded_tensor_slice
 
                 else :
                     new_state_dict[my_name] = state_dict[hf_name] 

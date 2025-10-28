@@ -9,7 +9,7 @@ if __name__ == "__main__":
         "I am watching TV"
         ]
     
-    engine = LLM.LLMEngine(model_path,device=1)
+    engine = LLM.LLMEngine(model_path)
     start = time.time()
     output = engine.generator(input_text,temperature=0.7,top_k=50)
     end = time.time()
@@ -19,3 +19,5 @@ if __name__ == "__main__":
         print(f"\n\noutput_text {i} : {output[i]}\n\n")
 
     print(end - start)  #5.68s
+
+    # CUDA_VISIBLE_DEVICES="3,4" torchrun --nproc_per_node=2 example.py
