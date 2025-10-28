@@ -11,21 +11,24 @@ state_dict = load_file(model_weights_path)
 
 class Attention(nn.Module):
 
-    def __init__(self,config):
+    def __init__(self,config,tp_rank,tp_size):
         super().__init__()
 
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.head_dim = config.head_dim
         self.all_head_size = config.all_head_size
         self.hidden_size = config.hidden_size
         self.max_seq_len = config.max_seq_len
         self.n_head = config.n_head
 
-        self.c_attn = nn.Linear(self.hidden_size, 3 * self.hidden_size)     #将QKV合为一个线性层
-        #self.key = nn.Linear(self.hidden_size,self.all_head_size)
-        #self.value = nn.Linear(self.hidden_size,self.all_head_size)
-        #self.query = nn.Linear(self.hidden_size,self.all_head_size)
+        self.sharded_n_head = config.n_head // tp_size
+ 
+        self.key = ColumnParallelLinear(self.hidden_size,self.all_head_size,tp_rank,tp_size)
+        self.value = ColumnParallelLinear(self.hidden_size,self.all_head_size,tp_rank,tp_size)
+        self.query = ColumnParallelLinear(self.hidden_size,self.all_head_size,tp_rank,tp_size)
 
-        self.proj = nn.Linear(self.hidden_size,self.hidden_size)
+        self.proj = RowParallelLinear(self.hidden_size,self.hidden_size,tp_rank,tp_size)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -37,12 +40,12 @@ class Attention(nn.Module):
         '''
         self.register_buffer(
             "mask",
-            torch.tril(torch.ones(self.max_seq_len,self.max_seq_len,device=config.device).view(1,1,self.max_seq_len,self.max_seq_len)) #下三角
+            torch.tril(torch.ones(self.max_seq_len,self.max_seq_len,device=tp_rank).view(1,1,self.max_seq_len,self.max_seq_len)) #下三角
         )
 
 
     def transpose_for_scores(self,x):
-        new_x_shape = x.size()[:-1] + (self.n_head,self.head_dim) #(batch,seq_len,768) -> (batch,seq_len,12,64)
+        new_x_shape = x.size()[:-1] + (self.sharded_n_head,self.head_dim) #(batch,seq_len,768) -> (batch,seq_len,12,64)
         x = x.view(new_x_shape)
         return x.permute(0,2,1,3) #维度置换 (batch,seq_len,n_head,head_dim) -> (batch,n_head,seq_len,head_dim)
 
@@ -53,13 +56,15 @@ class Attention(nn.Module):
                 ) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
         
         batch_size,seq_len,_ = hidden_state.size()
-        qkv = self.c_attn(hidden_state)
-        query,key,value = qkv.split(self.hidden_size,dim = -1)
+
+        query_layer = self.query(hidden_state)
+        key_layer = self.key(hidden_state)
+        value_layer = self.value(hidden_state)
 
         ##维度置换 (batch,seq_len,hidden_size) -> (batch,seq_len,n_head,head_dim) -> (batch,n_head,seq_len,head_dim)
-        query = self.transpose_for_scores(query)    
-        key = self.transpose_for_scores(key)
-        value = self.transpose_for_scores(value)
+        query = self.transpose_for_scores(query_layer)    
+        key = self.transpose_for_scores(key_layer)
+        value = self.transpose_for_scores(value_layer)
 
         if past_key_value is not None :     #有缓存 说明是decode
             past_key,past_value = past_key_value
@@ -75,7 +80,7 @@ class Attention(nn.Module):
 
         #只需在prefill阶段需要mask decode阶段不需要
         total_seq_len = key.shape[-2]
-        mask = self.mask[:,:,total_seq_len - seq_len:total_seq_len,total_seq_len - seq_len: total_seq_len]
+        mask = self.mask[:,:,total_seq_len - seq_len:total_seq_len,: total_seq_len]
         attention_scores = attention_scores.masked_fill(mask == 0,torch.finfo(attention_scores.dtype).min)
         '''
         masked_fill 方法：
@@ -88,7 +93,7 @@ class Attention(nn.Module):
 
         attention_scores = torch.matmul(attention_scores,value)   #(batch,n_head,seq_len,head_dim)
         attention_scores = attention_scores.permute(0,2,1,3).contiguous()   #(batch,seq_len,n_head,head_dim)
-        new_attention_scores_shape = attention_scores.size()[:-2] + (self.all_head_size,)   
+        new_attention_scores_shape = attention_scores.size()[:-2] + (self.all_head_size // self.tp_size,)   
         attention_scores = attention_scores.view(new_attention_scores_shape)    #(batch,seq_len,hidden_dim)
 
         output = self.proj(attention_scores)    #(bacth,seq_len,hidden_dim)
@@ -98,7 +103,7 @@ class Attention(nn.Module):
     
 class MLP(nn.Module):
 
-    def __init__(self,config):
+    def __init__(self,config,tp_rank,tp_size):
         super().__init__()
 
         '''
@@ -109,27 +114,28 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.resid_pdrop)
         '''
 
-        #提前讲MLP权重加载进来
-        c_fc_weight = state_dict[""]
-        self.net1 = ColumnParallelLinear()
+        #Tensor Parallel
+        self.net1 = ColumnParallelLinear(config.hidden_size,config.hidden_size * 4,tp_rank,tp_size)
+        self.activation = nn.GELU()
+        self.net2 = RowParallelLinear(config.hidden_size * 4,config.hidden_size,tp_rank,tp_size)
+        self.dropout = nn.Dropout(config.resid_pdrop)
 
-        
     
     def forward(self,hidde_state):
 
         output = self.net1(hidde_state)
         output = self.activation(output)
         output = self.net2(output)
-        output = self.dropout(output)
+        #output = self.dropout(output)
         return output
     
 
 class Block(nn.Module):
 
-    def __init__(self,config):
+    def __init__(self,config,tp_rank,tp_size):
         super().__init__()
-        self.att = Attention(config)
-        self.ffn = MLP(config)
+        self.att = Attention(config,tp_rank,tp_size)
+        self.ffn = MLP(config,tp_rank,tp_size)
         self.ln1 = nn.LayerNorm(config.hidden_size,eps=1e-05)
         self.ln2 = nn.LayerNorm(config.hidden_size,eps=1e-05)
 
@@ -153,13 +159,16 @@ class GPT2(nn.Module):
         其他地方差别不大
     '''
 
-    def __init__(self,config):
+    def __init__(self,config,
+                 tp_rank,
+                 tp_size):
         super().__init__()
+
         self.max_seq_len = config.max_seq_len
 
         self.token_embedding_table = nn.Embedding(config.vocab_size,config.n_embd)
         self.position_embedding_table = nn.Embedding(config.max_seq_len,config.n_embd)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([Block(config,tp_rank,tp_size) for _ in range(config.n_layer)])
         self.ln_final = nn.LayerNorm(config.n_embd,eps=1e-05)
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size,bias = False)
 
