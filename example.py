@@ -1,6 +1,7 @@
 import llm.LLM as LLM
 import time
 
+#此版本 仅有kvcache功能 用来对照
 model_path = "/data1/hfhub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e" 
 
 if __name__ == "__main__":
