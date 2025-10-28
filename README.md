@@ -13,9 +13,24 @@
 
 ## 2025.10.17
 在原模型的基础上加入了KV-cache功能。<br>
-对于同样的prompt,decode 900次 由11.56s -> 5.68s <br>
+对于同样的prompt,decode 900次 由25s -> 11s(之后的测试都用这个prompt,seed,后面不再赘述) <br>
 另外GPT2-137M 存放KV-cache的空间如下计算：<br>
 token_kvcache_size = 2 * n_layer * head_dim * 4(f32) = 2 * 12 * 768 * 4 = 73728B<br>
 seq_kvcache_size = max_seq_size * token_kvcache_size = 1024 * 73728B = 73728KB<br>
 batched_kvcache_size = batch_size * seq_kvcache_size = 12 * 73728KB / 1024 = 864MB<br>
+
+## 2025.10.28
+在kv-cache的基础上增加了张量并行优化 <br>
+张量并行分布在两个地方:Attention以及MLP <br>
+在只对MLP进行2GPU张量并行时，由11s -> 7s <br>
+但当加上Attention的张量并行时，由7s -> 8s <br>
+可能原因：<br>
+1.1次reduce变为2次reduce，通信开销增加  <br>
+2.gpt2的qkv一起加载到同一矩阵，我在处理时切分成了三个矩阵(未加张量并行时没有切分，这里考虑到好实现因拆分)，因此从启动一个内核变为启动三个内核增加开销，且三次矩阵乘法的时间开销也远高于一次矩阵乘法 <br>
+3.代码结构不佳，拖慢效率    <br>
+<br>
+后续计划：
+1.优化代码结构      <br>
+2.qkv融合       <br>
+3.词表并行      <br>
 
