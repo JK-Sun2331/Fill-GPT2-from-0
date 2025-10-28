@@ -1,0 +1,4 @@
+# 忽略Python字节码缓存
+__pycache__/
+*.py[cod]
+*$py.class
