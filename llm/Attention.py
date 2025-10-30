@@ -24,9 +24,7 @@ class Attention(nn.Module):
 
         self.sharded_n_head = config.n_head // tp_size
  
-        self.key = ColumnParallelLinear(self.hidden_size,self.all_head_size,tp_rank,tp_size)
-        self.value = ColumnParallelLinear(self.hidden_size,self.all_head_size,tp_rank,tp_size)
-        self.query = ColumnParallelLinear(self.hidden_size,self.all_head_size,tp_rank,tp_size)
+        self.c_attn = ColumnParallelLinear(self.hidden_size,self.all_head_size * 3,tp_rank,tp_size)
 
         self.proj = RowParallelLinear(self.hidden_size,self.hidden_size,tp_rank,tp_size)
 
@@ -57,14 +55,14 @@ class Attention(nn.Module):
         
         batch_size,seq_len,_ = hidden_state.size()
 
-        query_layer = self.query(hidden_state)
-        key_layer = self.key(hidden_state)
-        value_layer = self.value(hidden_state)
+        qkv = self.c_attn(hidden_state)
+
+        query,key,value = qkv.split(self.hidden_size // self.tp_size,dim = -1)
 
         ##维度置换 (batch,seq_len,hidden_size) -> (batch,seq_len,n_head,head_dim) -> (batch,n_head,seq_len,head_dim)
-        query = self.transpose_for_scores(query_layer)    
-        key = self.transpose_for_scores(key_layer)
-        value = self.transpose_for_scores(value_layer)
+        query = self.transpose_for_scores(query)    
+        key = self.transpose_for_scores(key)
+        value = self.transpose_for_scores(value)
 
         if past_key_value is not None :     #有缓存 说明是decode
             past_key,past_value = past_key_value

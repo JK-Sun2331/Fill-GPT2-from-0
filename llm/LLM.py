@@ -91,12 +91,8 @@ class LLMEngine:
             weight_mapping[f"blocks.{i}.ln2.weight"] = f"h.{i}.ln_2.weight"
             weight_mapping[f"blocks.{i}.ln2.bias"] = f"h.{i}.ln_2.bias"
             #attention
-            weight_mapping[f"blocks.{i}.att.query.weight"] = f"h.{i}.attn.c_attn.weight"
-            weight_mapping[f"blocks.{i}.att.key.weight"] = f"h.{i}.attn.c_attn.weight"
-            weight_mapping[f"blocks.{i}.att.value.weight"] = f"h.{i}.attn.c_attn.weight"
-            weight_mapping[f"blocks.{i}.att.query.bias"] = f"h.{i}.attn.c_attn.bias"
-            weight_mapping[f"blocks.{i}.att.key.bias"] = f"h.{i}.attn.c_attn.bias"
-            weight_mapping[f"blocks.{i}.att.value.bias"] = f"h.{i}.attn.c_attn.bias"
+            weight_mapping[f"blocks.{i}.att.c_attn.weight"] = f"h.{i}.attn.c_attn.weight"
+            weight_mapping[f"blocks.{i}.att.c_attn.bias"] = f"h.{i}.attn.c_attn.bias"
             
             weight_mapping[f"blocks.{i}.att.proj.weight"] = f"h.{i}.attn.c_proj.weight"
             weight_mapping[f"blocks.{i}.att.proj.bias"] = f"h.{i}.attn.c_proj.bias"
@@ -112,31 +108,27 @@ class LLMEngine:
             #因为用linear(input,output)初始化的权重 其权重形状是(output,input) 因此取权重时要转置
             if hf_name in state_dict:
                 if "attn.c_attn.weight" in hf_name:
-                    # hf_name 会被 Q, K, V 映射三次
-                    # 我们只在第一次 (query) 时处理，并同时加载 K 和 V
-                    if "query" not in my_name:
-                        continue 
 
                     weight = state_dict[hf_name].t()
                     
-                    
                     split_size = weight.size(0) // 3    
-                    q_weight,k_weight,v_weght = torch.split(weight,split_size,dim = 0) 
+                    q_weight,k_weight,v_weight = torch.split(weight,split_size,dim = 0) 
 
                     dim = 0
                     chunk_size = q_weight.shape[dim] // tp_size
                     start = tp_rank * chunk_size
                     end = (tp_rank + 1) * chunk_size
 
+                    sharded_q_proj_slice = q_weight[start:end].contiguous()
+                    sharded_k_proj_slice = k_weight[start:end].contiguous()
+                    sharded_v_proj_slice = v_weight[start:end].contiguous()
 
-                    new_state_dict[my_name] = q_weight[start:end,:].contiguous()
-                    new_state_dict[my_name.replace("query","key")] = k_weight[start:end,:].contiguous()
-                    new_state_dict[my_name.replace("query","value")] = v_weght[start:end,:].contiguous()
+                    sharded_c_attn = torch.cat((sharded_q_proj_slice,sharded_k_proj_slice,sharded_v_proj_slice),dim = 0)
+                    #print(f"\n\n sharded_c_attn.shape = {sharded_c_attn.shape} \n\n")
+                    new_state_dict[my_name] = sharded_c_attn
+                    
 
                 elif "attn.c_attn.bias" in hf_name:
-                    # 同样只在 "query" 时处理
-                    if "query" not in my_name:
-                        continue
                         
                     bias = state_dict[hf_name]
                     split_size = bias.size(0) // 3
@@ -147,9 +139,13 @@ class LLMEngine:
                     start = tp_rank * chunk_size
                     end = (tp_rank + 1) * chunk_size
 
-                    new_state_dict[my_name] = q_bias[start:end].contiguous()
-                    new_state_dict[my_name.replace("query","key")] = k_bias[start:end].contiguous()
-                    new_state_dict[my_name.replace("query","value")] = v_bias[start:end].contiguous()
+                    sharded_q_proj_slice = q_bias[start:end].contiguous()
+                    sharded_k_proj_slice = k_bias[start:end].contiguous()
+                    sharded_v_proj_slice = v_bias[start:end].contiguous()
+
+                    sharded_c_attn = torch.cat((sharded_q_proj_slice,sharded_k_proj_slice,sharded_v_proj_slice),dim = 0)
+
+                    new_state_dict[my_name] = sharded_c_attn
 
 
                 elif "attn.c_proj.weight" in hf_name:
