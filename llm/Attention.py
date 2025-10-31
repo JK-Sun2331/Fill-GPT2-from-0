@@ -49,9 +49,11 @@ class Attention(nn.Module):
 
 
     def forward(self,
-                hidden_state : torch.Tensor,
-                past_key_value : Optional[Tuple[torch.Tensor,torch.Tensor]] = None
-                ) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
+                hidden_state,
+                k_cache,
+                v_cache,
+                kv_length
+                ):
         
         batch_size,seq_len,_ = hidden_state.size()
 
@@ -64,20 +66,27 @@ class Attention(nn.Module):
         key = self.transpose_for_scores(key)
         value = self.transpose_for_scores(value)
 
-        if past_key_value is not None :     #有缓存 说明是decode
-            past_key,past_value = past_key_value
-            key = torch.cat((past_key,key),dim = -2)    #在 seq_len维度拼接
-            value = torch.cat((past_value,value),dim = -2)
+        if kv_length == 0 :
+            k_cache[:,:,0 : seq_len,:] = key
+            v_cache[:,:,0 : seq_len,:] = value
+            kv_length += seq_len
 
-        present_key_value = (key,value)
+        else :     #有缓存 说明是decode
+            k_cache[:,:,kv_length : kv_length + 1,:] = key
+            v_cache[:,:,kv_length : kv_length + 1,:] = value
+            kv_length += 1
+        
+        key_cached = k_cache[:,:,:kv_length,:]
+        value_cached = v_cache[:,:,:kv_length,:]
 
-        attention_scores = torch.matmul(query,key.transpose(-1,-2)) #将key的后两维转置
+
+        attention_scores = torch.matmul(query,key_cached.transpose(-1,-2)) #将key的后两维转置
         #torch.matmul()处理高维矩阵乘法：当输入维度高于2时会执行批量矩阵乘法 (...,m,p) * (...,p,n) = (...,m,n)
         #attention_scores = (batch,n_head,seq_len,head_dim) * (batch,n_head,head_dim,seq_len) = (batch,n_head,seq_len,seq_len)
         attention_scores = attention_scores / (self.head_dim ** 0.5)
 
         #只需在prefill阶段需要mask decode阶段不需要
-        total_seq_len = key.shape[-2]
+        total_seq_len = key_cached.shape[-2]
         mask = self.mask[:,:,total_seq_len - seq_len:total_seq_len,: total_seq_len]
         attention_scores = attention_scores.masked_fill(mask == 0,torch.finfo(attention_scores.dtype).min)
         '''
@@ -89,14 +98,14 @@ class Attention(nn.Module):
         attention_scores = F.softmax(attention_scores,dim=-1)
         attention_scores = self.attn_dropout(attention_scores)
 
-        attention_scores = torch.matmul(attention_scores,value)   #(batch,n_head,seq_len,head_dim)
+        attention_scores = torch.matmul(attention_scores,value_cached)   #(batch,n_head,seq_len,head_dim)
         attention_scores = attention_scores.permute(0,2,1,3).contiguous()   #(batch,seq_len,n_head,head_dim)
         new_attention_scores_shape = attention_scores.size()[:-2] + (self.all_head_size // self.tp_size,)   
         attention_scores = attention_scores.view(new_attention_scores_shape)    #(batch,seq_len,hidden_dim)
 
         output = self.proj(attention_scores)    #(bacth,seq_len,hidden_dim)
         output = self.resid_dropout(output)
-        return output,present_key_value
+        return output,kv_length
 
     
 class MLP(nn.Module):
@@ -138,15 +147,17 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(config.hidden_size,eps=1e-05)
 
     def forward(self,
-                hidden_states : torch.Tensor,
-                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-                ) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
+                hidden_states,
+                k_cache,
+                v_cache,
+                kv_length
+                ):
         
-        attn_output,present_key_value = self.att(self.ln1(hidden_states),past_key_value)
+        attn_output,kv_length = self.att(self.ln1(hidden_states),k_cache,v_cache,kv_length)
         hidden_states = hidden_states + attn_output
         ffn_output = self.ffn(self.ln2(hidden_states))
         hidden_states = hidden_states + ffn_output
-        return hidden_states,present_key_value
+        return hidden_states,kv_length
     
 class GPT2(nn.Module):
     '''
@@ -174,30 +185,31 @@ class GPT2(nn.Module):
 
     
     def forward(self,
-                input_ids : torch.Tensor,
-                past_key_value : Optional[Tuple[Tuple[torch.Tensor,torch.Tensor]]] = None
-                ) -> Tuple[torch.Tensor,Tuple[Tuple[torch.Tensor,torch.Tensor]]]:
+                input_ids,
+                k_cache,
+                v_cache,
+                kv_length
+                ):
         
         device = input_ids.device
         batch,seq_len = input_ids.size()      #(batch,seq_len)
         #assert seq_len <= self.max_seq_len , f"序列长度超出最大序列长度 seq_len = {seq_len},max_seq_len = {self.max_seq_len}"
 
-        past_lenth = past_key_value[0][0].shape[-2] if past_key_value is not None else 0
-        position_ids = torch.arange(past_lenth,past_lenth + seq_len,device=device)
+        position_ids = torch.arange(kv_length,kv_length + seq_len,device=device)
 
         token_embd = self.token_embedding_table(input_ids)    #(batch,seq_len,n_embd)
         pos_embd = self.position_embedding_table(position_ids)
         hidden_states = token_embd + pos_embd       #(batch,seq_len,n_embd)
 
-        presents = []
 
         for i,block in enumerate(self.blocks):
-
-            past_layer = past_key_value[i] if past_key_value is not None else None
-            hidden_states,present_key_value = block(hidden_states = hidden_states,past_key_value = past_layer)
-            presents.append(present_key_value)
+            hidden_states,kv_length_output = block(
+                hidden_states = hidden_states,
+                k_cache = k_cache[i],
+                v_cache = v_cache[i],
+                kv_length = kv_length)
 
         hidden_states = self.ln_final(hidden_states)
         logits = self.lm_head(hidden_states)        #(batch,seq_len,vocab_size)
-        return logits,tuple(presents)
+        return logits,kv_length_output
 
