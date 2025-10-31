@@ -34,3 +34,6 @@ batched_kvcache_size = batch_size * seq_kvcache_size = 12 * 73728KB / 1024 = 864
 2.qkv融合       <br>
 3.词表并行      <br>
 
+## 2025.10.30
+qkv融合，由原来的三次矩阵计算变为一次矩阵计算，平均能加快0.2s-0.3s  <br>
+
