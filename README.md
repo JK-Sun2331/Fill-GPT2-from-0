@@ -1,3 +1,9 @@
+## 项目部署步骤：   <br>
+1.首先运行DataDownloading.py下载gpt2模型权重(或读取自己本地路径)    <br>
+2.之后修改example.py中的模型路径    <br>
+3.运行example.py    <br>
+
+
 ## 2025.10.9 
 初步实现了gpt2-137M的朴素实现，但回答问题时答非所问
 
